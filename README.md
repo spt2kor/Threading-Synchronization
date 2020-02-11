@@ -17,6 +17,15 @@ http://greenteapress.com/semaphores/LittleBookOfSemaphores.pdf
 # Process VS Threads VS Fibers VS Meta Process VS Message Passing Interface
 https://locklessinc.com/articles/new_threading/
 
+# Spinlocks and Read-Write Locks
+https://locklessinc.com/articles/locks/
+
+
+
+
+
+
+==========================================
 # TODO:
   ## Parallel Computing: Theory and Practice
 http://www.cs.cmu.edu/afs/cs/academic/class/15210-f15/www/tapp.html
