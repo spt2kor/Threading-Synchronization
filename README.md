@@ -22,7 +22,8 @@ https://locklessinc.com/articles/locks/
 
 
 
-
+# The Singleton Pattern : "double-checked locking" pattern.
+https://locklessinc.com/articles/singleton_pattern/
 
 
 ==========================================
