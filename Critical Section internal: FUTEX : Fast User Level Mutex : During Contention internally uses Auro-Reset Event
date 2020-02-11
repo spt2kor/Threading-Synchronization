@@ -1,0 +1,246 @@
+# Critical Section internal: FUTEX : Fast User Level Mutex : During Contention internally uses Auro-Reset Event 
+
+Break Free of Code Deadlocks in Critical Sections Under Windows
+https://docs.microsoft.com/en-us/archive/msdn-magazine/2003/december/break-free-of-code-deadlocks-in-critical-sections-under-windows
+
+
+
+10/22/2019
+29 minutes to read
+[Editor's Update - 7/23/2004: This article is intended for informational purposes only and its contents should not be used to create production code. The article discusses undocumented data structures and processes internal to the Windows operating system that are subject to change in future versions, such as Longhorn.]
+
+Threading
+
+Break Free of Code Deadlocks in Critical Sections Under Windows
+
+Matt Pietrek and Russ Osterlund
+
+Code download available at:CriticalSections.exe(415 KB)
+
+This article assumes you're familiar with Win32, C++, and Multithreading
+
+Level of Difficulty123
+
+SUMMARY
+
+Critical sections, a mechanism that prohibits more than one thread at a time from executing a particular section of code, is a topic that has not received much attention and thus tends not to be well understood. A solid understanding of critical sections in Windows can really come in handy when you need to track down multithreading performance issues in your code. This articles delves under the hood of critical sections to reveal information useful in finding deadlocks and in pinpointing performance problems. It also includes a handy utility program that shows all of your critical sections and their current states.
+
+Contents
+
+Critical Sections: a Brief Review
+Digging In: the RTL_CRITICAL_SECTION Structure
+The RTL_CRITICAL_SECTION_DEBUG Structure
+Critical Section States
+Building a Better Mousetrap
+The MyCriticalSections Utility
+Spelunking in Key Critical Section Routines
+Conclusion
+
+In our many combined years of programming, we're quite surprised that Win32® critical sections haven't received very much "under the hood" attention. Sure, you probably know the basics of initializing and using critical sections, but have you ever taken the time to dig into the CRITICAL_SECTION structure defined in WINNT.H? There are some interesting goodies in this structure that have long been ignored. We'll remedy that and show you some interesting tidbits that come in handy when tracking down elusive multithreading bugs. More importantly, using our MyCriticalSections utility, you'll see how a CRITICAL_SECTION can be trivially extended to provide very slick features that can be used for both debugging and performance tuning (for complete code download, see the link at the top of this article).
+
+To be honest, part of the reason that writers have ignored the CRITICAL_SECTION structure is that it's implemented very differently under the two main Win32 code bases: Microsoft® Windows® 95 and Windows NT®. Everyone knows that both code bases have spawned numerous descendents (most recently, Windows Me and Windows XP, respectively), but it's not necessary to list them all here. The point is that now that Windows XP is well established, developers can soon drop support for the Windows 95 line of operating systems. We have done so in this article.
+
+Admittedly, most of the interest these days is in the Microsoft .NET Framework, but good old-fashioned Win32 programming isn't going away anytime soon. If you have existing Win32 code that makes use of critical sections, you'll find our tools and descriptions of critical section states to be useful. However, it's important to note that we're only discussing Windows NT and its successors and won't be covering anything related to .NET.
+
+Critical Sections: a Brief Review
+
+If you're intimately familiar with critical sections and can use them without blinking, feel free to skip this section. Otherwise, read along for a quick refresher. The sections that follow this one won't make much sense unless you are familiar with the basics.
+
+A critical section is a lightweight mechanism for allowing only one thread at a time to execute a given piece of code. Critical sections are typically used when modifying global data such as collection classes. Unlike events, mutexes, and semaphores, which are also used for multithreaded synchronization, critical sections don't always perform an expensive control transfer to kernel mode. As you'll see later, acquiring an unheld critical section requires, in effect, just a few memory modifications and is very quick. Only if you try to acquire an already-held critical section does it jump into kernel mode. The downside to this lightweight behavior is that critical sections can only be used to synchronize threads within the same process.
+
+A critical section is represented by the RTL_CRITICAL_SECTION structure defined in WINNT.H. You might not be aware of this because your C++ code typically declares a variable of type CRITICAL_SECTION. Examine WINBASE.H and you'll find this:
+
+
+Copy
+typedef RTL_CRITICAL_SECTION CRITICAL_SECTION;
+We'll dig through the RTL_CRITICAL_SECTION structure in short order. For the moment, the important thing is that a CRITICAL_SECTION (also known as an RTL_CRITICAL_SECTION) is just a structure with readily accessible fields that are manipulated by KERNEL32 APIs.
+
+The life of a critical section begins when it's passed to InitializeCriticalSection (or more accurately, when its address is passed). Once initialized, your code passes the critical section to the EnterCriticalSection and LeaveCriticalSection APIs. Once a thread returns from EnterCriticalSection, all other threads that call EnterCriticalSection block until the first thread calls LeaveCriticalSection. Finally, when you no longer need the critical section, good coding practice dictates that you pass it to DeleteCriticalSection.
+
+In the ideal case where a critical section is unowned, a call to EnterCriticalSection is very fast because it simply reads and modifies memory locations within user-mode memory. Otherwise (with one exception that we'll get to later), threads that block on a critical section do so efficiently, without burning up extra CPU cycles. Blocked threads wait in kernel mode and aren't schedulable until the critical section owner releases it. If multiple threads are blocked on a critical section, only one thread acquires the critical section when another thread releases it.
+
+Digging In: the RTL_CRITICAL_SECTION Structure
+
+Even if you've used critical sections in your everyday work, odds are you haven't really looked beyond the documentation. It turns out there's quite a lot that can be learned relatively easily. For instance, it's not well known that a process's critical sections are kept in a linked list and can be enumerated. In fact, WINDBG supports the !locks command, which lists all the critical sections of the target process. The utility that we'll come to shortly also uses this little-known aspect of critical sections. In order to really understand how our utility works, it's essential to truly grasp the internals of critical sections. With that in mind, let's begin by examining the RTL_CRITICAL_SECTION structure. For convenience, the structure is shown here:
+
+
+Copy
+struct RTL_CRITICAL_SECTION { PRTL_CRITICAL_SECTION_DEBUG DebugInfo; LONG LockCount; LONG RecursionCount; HANDLE OwningThread; HANDLE LockSemaphore; ULONG_PTR SpinCount; };
+The following paragraphs describe each field.
+
+DebugInfo This field contains a pointer to a system-allocated companion structure of type RTL_CRITICAL_SECTION_DEBUG. This structure contains more nuggets of information and is also defined in WINNT.H. We'll look at it in more depth shortly.
+
+LockCount This is the most important field in a critical section. It is initialized to a value of -1; a value of 0 or greater indicates that the critical section is held or owned. When it's not equal to -1, the OwningThread field (this field is incorrectly defined in WINNT.H—it should be a DWORD instead of a HANDLE) contains the thread ID that owns this critical section. The delta between this field and the value of (RecursionCount -1) indicates how many additional threads are waiting to acquire the critical section.
+
+RecursionCount This field contains the number of times that the owning thread has acquired this critical section. If this value is zero, the next thread that attempts to acquire the critical section will be successful.
+
+OwningThread This field contains the thread identifier for the thread that currently holds the critical section. This is same thread ID that APIs like GetCurrentThreadId return.
+
+LockSemaphore This field is misnamed; it's really an auto-reset event, not a semaphore. It's a kernel object handle and it's used to signal the operating system that the critical section is now free. The operating system silently creates one of these the first time a thread tries to acquire the critical section, but is blocked by another thread already owning it. You should call DeleteCriticalSection (which issues a CloseHandle call on the event and frees the debug structure if necessary) or a resource leak will occur.
+
+SpinCount Only used on multiprocessor systems. The MSDN® documentation describes this field as follows: "On multiprocessor systems, if the critical section is unavailable, the calling thread will spin dwSpinCount times before performing a wait operation on a semaphore associated with the critical section. If the critical section becomes free during the spin operation, the calling thread avoids the wait operation." Spin counts can offer better performance on multiprocessor machines since it's often faster to spin in a loop than to enter a kernel-mode wait state. This field defaults to zero, but can be set to a different value with the InitializeCriticalSectionAndSpinCount API.
+
+The RTL_CRITICAL_SECTION_DEBUG Structure
+
+Earlier we noted that within the RTL_CRITICAL_SECTION structure, the DebugInfo field points to an RTL_CRITICAL_SECTION_DEBUG structure, which is shown here:
+
+
+Copy
+struct _RTL_CRITICAL_SECTION_DEBUG { WORD Type; WORD CreatorBackTraceIndex; RTL_CRITICAL_SECTION *CriticalSection; LIST_ENTRY ProcessLocksList; DWORD EntryCount; DWORD ContentionCount; DWORD Spare[ 2 ]; }
+This structure is allocated and initialized by InitializeCriticalSection. It is allocated either from a pre-allocated array inside NTDLL or from the process heap. This companion to the RTL_CRITICAL_SECTION contains a collection of matching fields with widely disparate roles: two are mysterious, the next two provide the keys for understanding the structure of the critical section chain, two are Siamese twins, and the final two are unused.
+
+Here's a description of the RTL_CRITICAL_SECTION fields.
+
+Type This field is not used and is initialized to a value of 0.
+
+CreatorBackTraceIndex This field is only used for diagnostic situations. Under the registry key HKLM\Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\YourProgram are the keyfield, GlobalFlag, and StackTraceDatabaseSizeInMb values. Note that these values only appear if you run the Gflags commands described later. When these registry values are set correctly, the CreatorBackTraceIndex field is filled with an index value used in the stack trace. More information on this can be found by performing a search on MSDN for the phrases "create user mode stack trace database" and "enlarging the user-mode stack trace database" in the GFlags documentation.
+
+CriticalSection Points to the RTL_CRITICAL_SECTION associated with this structure. Figure 1 illustrates the underlying structure and relationships between RTL_CRITICAL_SECTION, RTL_CRITICAL_SECTION_DEBUG, and other participants in the chain of events.
+
+Figure 1 Critical Section Process Flow
+
+Figure 1** Critical Section Process Flow **
+
+ProcessLocksList A LIST_ENTRY is the standard Windows data structure used to represent nodes in a doubly linked list. The RTL_CRITICAL_SECTION_DEBUG contains one as part of a linked list, allowing the critical sections to be traversed forwards and backwards. The utility presented later in this article demonstrates how to use the Flink (forward link) and Blink (back link) fields to move from member to member in a list. Anyone who has worked with device drivers or done any spelunking in the Windows kernel will recognize this data structure as an old friend.
+
+EntryCount/ContentionCount These fields are both incremented at the same time and for the same reason. It is the number of threads that have entered a wait state because they could not immediately acquire the critical section. Unlike the LockCount and RecursionCount fields, these fields are never decremented.
+
+Spares These two fields aren't used or even initialized (although they are zeroed out when the critical section structures are deleted). As we'll show later, these unused fields can be put to work to hold useful diagnostic values.
+
+Even though the RTL_CRITICAL_SECTION_DEBUG contains a hodgepodge of fields, it is a necessary component to the regular critical section structure. In fact, if the system happens to be unable to acquire storage for this structure from the process' heap, InitializeCriticalSection returns a LastError result of STATUS_NO_MEMORY and then returns a critical section structure in an incomplete state.
+
+Critical Section States
+
+As your program executes, and enters and leaves critical sections, the fields in RTL_CRITICAL_SECTION and RTL_CRITICAL_SECTION_DEBUG structures change according to the state the critical section is in. The fields are updated by bookkeeping code in the critical section APIs, which we'll see later. These states are more interesting if your program is multithreaded and its thread access is a common resource guarded by a critical section.
+
+There are, however, two states that are present regardless of the thread usage of the code. First, if the LockCount field has a value other than -1, the critical section is held and the OwningThread field contains the thread identifier of the thread that owns the critical section. In multithreaded programs, the LockCount in conjunction with the RecursionCount will tell how many threads are currently blocked on the critical section. Second, if RecursionCount is a value greater than 1, this tells you how many times the owning thread has (perhaps unnecessarily) reacquired the critical section, either by calling EnterCriticalSection or TryEnterCriticalSection. Any value that's greater than 1 may be an indication of inefficiencies or future bugs in your code. For example, any of your C++ class methods that access a common resource may be reentering the critical section unnecessarily.
+
+It is important to note that the vast majority of the time, the LockCount and RecursionCount fields contain their initialized values, -1 and 0, respectively. In fact, for single-threaded programs, you cannot tell by merely examining these fields if the critical section has ever been acquired. However, multithreaded programs leave behind a few indications of whether two or more threads have attempted to own the same critical section at the same time.
+
+One of the indications you'll find is when the LockSemaphore field contains a nonzero value even when the critical section is not held. This indicates that, at one time, the critical section blocked one or more threads—the event handle is used to signal that the critical section was freed up and that one of the threads waiting on the critical section could now acquire it and continue execution. Because the OS silently allocates the event handle when a critical section blocks another thread, if you neglect to delete your critical sections when they are no longer needed, the LockSemaphore field can create resource leaks in your program.
+
+Another state that you may see in a multithreaded program is one in which the EntryCount and ContentionCount fields contain a value greater than zero. These two fields hold the number of times that the critical section blocked a thread. They are incremented each time this happens, but are never decremented during the lifetime of the critical section. These fields can be used to indirectly determine the execution path and characteristics of your program. For instance, a very high EntryCount means that the critical section is undergoing a lot of contention and is a potential bottleneck in the execution of the code.
+
+While examining a deadlocked program, we also found a state for which there seemed to be no logical explanation. The LockCount field for one heavily used critical section contained a value greater than -1; that is, it was owned, but the OwningThread field was zero (which destroyed evidence against the guilty thread). The test program was multithreaded, and the condition arose on both single and multiprocessor machines. Although LockCount and other values differed from run to run, the program always deadlocked on the same critical section. We'd definitely be curious to find out if any other developers out there have seen the API call sequence leading up to this state.
+
+Building a Better Mousetrap
+
+As we were learning about the workings of critical sections, we stumbled across a few key discoveries that make a nifty utility possible. The first was the presence of the ProcessLocksList LIST_ENTRY field which gave us the idea that a process's critical sections might be enumerable. An additional big discovery was that we learned how to find the head of the critical section list. Another key insight was that the Spare fields of the RTL_CRITICAL_SECTION could be written to with impunity (at least in all of our testing). We also found that we could easily override some of the system's critical section routines without requiring any modification to source files.
+
+Initially, we started out with a simple program that walked all the critical sections of a process and listed their current states to see if they were owned or unowned. If owned, we'd find out which thread owned it, and how many threads were blocked on it? While doing this is mildly intriguing to the OS enthusiast, it's not enough to be extremely useful for the typical programmer who just wants a little help understanding their program.
+
+In even the simplest console-mode "Hello World" program there are dozens of critical sections. The vast majority are created by system DLLs such as USER32 or GDI32, and are rarely responsible for deadlocks or performance issues. We wanted a way to filter out these critical sections and leave only the interesting ones in your code. The Spare fields in the RTL_CRITICAL_SECTION_DEBUG structure work quite nicely for this. You can use either or both of them to indicate that a critical section is from user-written code, rather than from the OS.
+
+The next logical issue then becomes how to determine which critical sections are from your code. Some of you may remember LIBCTINY.LIB from Matt Pietrek's January 2001 Under The Hood column. One of the tricks LIBCTINY employs is a LIB file that overrides the standard implementation of key Visual C++ runtime routines. By putting the LIBCTINY.LIB file ahead of other LIBs on the linker line, the linker uses that implementation, rather than subsequent versions with the same name from the import libraries supplied by Microsoft.
+
+To make similar magic happen for critical sections, we created a replacement version of InitializeCriticalSection and an associated import library. By placing this LIB file ahead of KERNEL32.LIB, the linker links against our version, rather than that of KERNEL32. Our implementation of InitializeCriticalSection is shown in Figure 2. The code is conceptually very simple. It first calls the real InitializeCriticalSection in KERNEL32.DLL. Next, it obtains the address of the code that called InitializeCriticalSection and sticks it in one of the spare fields of the RTL_CRITICAL_SECTION_DEBUG structure. How does our code determine the calling code's address? An x86 CALL instruction places the return address on the stack. The CriticalSectionHelper code knows that the return address will be at a known, fixed location within the stack frame.
+
+Figure 2 CriticalSectionHelper.cpp
+
+
+Copy
+//====================================================================== // Russ Osterlund / Matt Pietrek // MSDN Magazine, 2003 //====================================================================== #define WIN32_LEAN_AND_MEAN #include <windows.h> #include "CriticalSectionHelper.h" typedef void (__stdcall *PFNINITIALIZECRITICALSECTION)( LPCRITICAL_SECTION ); static PFNINITIALIZECRITICALSECTION s_pfnInitializeCriticalSection = 0; #pragma optimize( "y", on ) // Ensure that we get standard stack frames #pragma warning(disable :4273) // We're overloading a function // from WinBase.H. The compiler // will be unhappy, so quiet it. extern "C" void __stdcall InitializeCriticalSection(LPCRITICAL_SECTION lpCriticalSection ) { if ( !s_pfnInitializeCriticalSection ) { HMODULE hModuleKERNEL32 = GetModuleHandle( "KERNEL32.DLL" ); s_pfnInitializeCriticalSection = (PFNINITIALIZECRITICALSECTION) GetProcAddress( hModuleKERNEL32, "InitializeCriticalSection" ); } s_pfnInitializeCriticalSection( lpCriticalSection ); DWORD pReturnAddress; __asm mov eax, dword ptr [ebp+4] __asm mov [pReturnAddress], eax // Set one of the "spare" fields in the critical section to // the return address. We subtract 6, since the return // address is after the "CALL" instruction, which is // typically 6 bytes. Being off by 6 bytes is usually // enough for the line # lookup to pick the wrong line of // code. lpCriticalSection->DebugInfo->Spare[0] = pReturnAddress 6; lpCriticalSection->DebugInfo->Spare[1] = MYCRITSECT_SIGNATURE; } #if 0 extern "C" __stdcall BOOL InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION lpCriticalSection, DWORD dwSpinCount ); #endif
+The net effect is that any EXE or DLL that's linked correctly with our CriticalSectionHelper.lib will import our DLL (CriticalSectionHelper.DLL), and will have critical sections with their spare fields put to use. This makes things a lot easier. Now our utility can simply walk all the critical sections in a process and only display information for the critical sections with a properly filled-in Spare field. Now how much would you pay for this utility? But wait just a minute, there's more!
+
+Since all your critical sections will now contain the address where they were initialized, a utility can identify each individual critical section by providing its initialization address. Raw code addresses by themselves aren't that helpful, though. Luckily, DBGHELP.DLL makes it almost trivial to translate a code address into a source file, line number, and function name. Even if a critical section doesn't have your signature in it, its address can be given to DBGHELP.DLL. If it was declared as a global variable, and if symbols are available, odds are that you can determine the critical section's name in the original source code. As a side note, you'll get great results if you let DbgHelp work its magic by setting the _NT_SYMBOL_PATH environment variable, and setting up DbgHelp to use its Symbol Server download functionality.
+
+The MyCriticalSections Utility
+
+Putting all our ideas together, we came up with the MyCriticalSections program. MyCriticalSections is a command-line program with a few options that are seen by running it with no arguments:
+
+
+Copy
+Syntax: MyCriticalSections <PID> [options] Options: /a = all critical sections /e = show only entered critical sections /v = verbose
+The only required argument is a Program ID or PID (in decimal form). PIDs can be obtained by many means, but the easiest way is probably through the Task Manager. With no other options, MyCriticalSections lists the state of all critical sections from your code modules that you've linked CriticalSectionHelper.DLL into. If there are symbols available for the module(s), the code attempts to provide the name of the critical section and where it was initialized.
+
+To see MyCriticalSections in action, run the Demo.EXE program that's included with the download. Demo.EXE simply initializes two critical sections and enters them from a couple of threads. Figure 3 shows the results of running "MyCriticalSections 2040" (where 2040 is the PID of Demo.EXE).
+
+Figure 3 MyCriticalSections Output
+
+
+Copy
+Initializing symbol engine Symbol engine initialized OK ------------------------------------------------------------------------- Critical Section 70 Address: 0x00437B38 !csMain Initialized in function DEMO!main+00000025 Initialized at c:\projects\mycriticalsections\demo\demo.cpp, line 19 LockCount: 0 Recursion: 1 Held by: 2348 (92C) DebugInfo: Entry Count: 0 ------------------------------------------------------------------------- Critical Section 71 Address: 0x00437B20 DEMO!yetAnotherCriticalSection Initialized in function DEMO!main+0000004D Initialized at c:\projects\mycriticalsections\demo\demo.cpp, line 22 LockCount: 3 Recursion: 3 Held by: 2348 (92C) Threads Waiting: 1 DebugInfo: Entry Count: 1 125 Critical Sections examined, 2 initialized with signature
+In the figure, there are two critical sections listed. In this example, they're named csMain and yetAnotherCriticalSection. Each Address: line shows the address of the CRITICAL_SECTION along with its name. The "Initialized in" lines contain the name of the function in which the CRITICAL_SECTION was initialized. The "Initialized at" lines of code show the source file and line number within the initializing function.
+
+For the csMain critical section, you'll see a lock count of 0 and a recursion count of 1, indicating a critical section that's been acquired by one thread and with no other threads waiting on it. Since no thread has ever blocked on it, the Entry Count field is 0.
+
+Turning to yetAnotherCriticalSection, you'll see a recursion count of three. A quick look at the Demo code shows that the main thread calls EnterCriticalSection three times, so things are working as expected. However, a second thread has also attempted to acquire it and has blocked. As such, the LockCount field is also 3. The output shows that there's one waiting thread.
+
+MyCriticalSections has a few options that make it useful for the more intrepid explorer. The /v switch displays more information for each critical section. The spin count and lock semaphore fields are of particular interest. You'll often see that NTDLL and other DLLs have critical sections with nonzero spin counts. The lock semaphore field will be nonzero if a thread has ever blocked while in the process of acquiring the critical section. The /v switch also shows the contents of the spare fields in the RTL_CRITICAL_SECTION_DEBUG structure.
+
+The /a switch displays all critical sections in the process, even if they don't have the CriticalSectionHelper.DLL signature in place. If you use /a, be prepared for lots of output. The hardcore hacker will want to use /a and /v together to show the maximum amount of detail for everything in the process. One of the side benefits of using /a is that you'll see the LdrpLoaderLock critical section in NTDLL. This critical section is held during DllMain calls and at other key times. LdrpLoaderLock has been the silent partner in many of our obscure, seemingly inexplicable deadlocks. (In order for MyCriticalSection to correctly label the LdrpLoaderLock instance, you'll need the PDB file for NTDLL to be available.)
+
+The /e switch causes the program to display only critical sections that are currently held. Without the /a switch, it only shows held critical sections in your code (as indicated by our signature in the spare field). With the /a switch, it shows all owned critical sections in the process, regardless of where they're from.
+
+So, when would you want to run MyCriticalSections? An obvious time is when a program has deadlocked. Examine the held critical sections to see if anything jumps out at you. You can use MyCriticalSections even if the deadlocked program is being run under the control of a debugger.
+
+Another use for MyCriticalSections is when you're performance tuning highly multithreaded programs. When you're stopped in a heavily used, non-reentrant function in the debugger, run MyCriticalSections to see what critical sections are held at that moment. If you have many threads all performing the same work, it's easy to get into situations where the majority of a thread's time is spent waiting to acquire a heavily used critical section. If you have several heavily used critical sections, they're similar to kinks in a garden hose. Fixing one contention problem simply shifts the problem to the next bottlenecking critical section.
+
+A good way to see what the most contentious critical sections are is to set a breakpoint near the end of your program. When you hit the breakpoint, run MyCriticalSections and look for critical sections with the largest Entry Count values. These are the critical sections that have caused the most blocking and resultant thread switches.
+
+Although MyCriticalSections runs on Windows 2000 and later, you'll need a relatively new version of DbgHelp.DLL—version 5.1 or later. This is the version that comes with Windows XP. You can also get it from other tools that use DbgHelp. For example, the Debugging Tools For Windows download usually has the most recent DbgHelp.DLL.
+
+Spelunking in Key Critical Section Routines
+
+This final section is for the fearless reader who wants to understand the guts of the critical section implementation. Doing a careful examination of NTDLL, we were able to create pseudocode for these routines and their supporting subroutines (see NTDLL(CriticalSections).cpp in the download). The following KERNEL32 APIs make up the public interface to critical sections:
+
+
+Copy
+InitializeCriticalSection InitializeCriticalSectionAndSpinCount DeleteCriticalSection TryEnterCriticalSection EnterCriticalSection LeaveCriticalSection
+The first two APIs are merely thin wrappers around the NTDLL APIs RtlInitializeCriticalSection and RtlInitializeCriticalSectionAndSpinCount, respectively. All the remaining routines are forwarded to functions in NTDLL. What's more, a call to RtlInitializeCriticalSection is another thin wrapper around a call to RtlInitializeCriticalSectionAndSpinCount, with a spin-count value of 0. Behind the curtain, you're really using the following NTDLL APIs when using critical sections:
+
+
+Copy
+RtlInitializeCriticalSectionAndSpinCount RtlEnterCriticalSection RtlTryEnterCriticalSection RtlLeaveCriticalSection RtlDeleteCriticalSection
+In this discussion, we'll use the Kernel32 names because they are more familiar to most Win32 programmers.
+
+The initialization of a critical section by InitializeCriticalSectionAndSpinCount is straightforward. The fields in the RTL_CRITICAL_SECTION structure are given their starting values. Likewise, the RTL_CRITICAL_SECTION_DEBUG structure is allocated and initialized, the CreatorBackTraceIndex is given the return value from a call to RtlLogStackBackTrace, and links to the preceding critical section are established.
+
+Incidentally, CreatorBackTraceIndex normally receives a value of 0. If you have the Gflags and Umdh utilities, however, you can enter the following commands:
+
+
+Copy
+Gflags /i MyProgram.exe +ust Gflags /i MyProgram.exe /tracedb 24
+These commands cause registry entries to be added under "Image File Execution Options" for MyProgram. You should now see this field receive a value other than 0 with the next execution of MyProgram. For more information, take a look at the Knowledge Base article Q268343, "Umdhtools.exe: How to Use Umdh.exe to Find Memory Leaks". One additional point to note with the initialization of critical sections is that the first 64 RTL_CRITICAL_SECTION_DEBUG structures are not allocated from the process's heap, but instead come from an array located inside NTDLL's .data section.
+
+When you have finished using a critical section, the call to DeleteCriticalSection (badly named because only the RTL_CRITICAL_SECTION_ DEBUG is deleted) travels an equally understandable path. If an event was created because threads were blocked trying to acquire the critical section, the event is destroyed with a call to ZwClose. Next, after acquiring protection through the RtlCriticalSectionLock (NTDLL guards its own internal critical section list with—you guessed it—a critical section), the critical section linked-list is updated to reflect the destruction of the debug information by eliminating it from the chain. The memory is null-filled and, if its storage was acquired from the process' heap, a call to RtlFreeHeap causes its memory to be releasd. Finally, the RTL_CRITICAL_SECTION is zero filled.
+
+There are two APIs to acquire a resource guarded by a critical section, TryEnterCriticalSection and EnterCriticalSection. If a thread needs to enter a critical section but can perform useful work while waiting for a blocked resource to become free, then TryEnterCriticalSection is your ticket. This routine tests if the critical section is available; if it isn't free, the code returns with a value of FALSE, giving the thread the opportunity to continue with another task. Otherwise, it acts just like EnterCriticalSection.
+
+If the thread absolutely needs to own the resource before continuing, use EnterCriticalSection. For the moment, set aside the SpinCount test used on multiprocessor machines. This routine, like TryEnterCriticalSection, adjusts the bookkeeping for the critical section if it is free or already owned by the thread. It's important to note that the all-important LockCount increment is done using the x86 "lock" prefix. This ensures that only one CPU at a time can modify the LockCount field. (In fact, the Win32 InterlockedIncrement API is just an ADD instruction with the same lock prefix.)
+
+If the calling thread can't immediately acquire the critical section, RtlpWaitForCriticalSection is called to place the thread into a wait state. On multiprocessor systems, EnterCriticalSection spins the number of times specified by SpinCount and tests for the availability of the critical section during each loop iteration. If the critical section becomes free during this looping, the thread acquires the critical section and continues executing.
+
+RtlpWaitForCriticalSection is probably the most complicated and important of all the procedures presented here. This isn't too surprising because if you have a deadlock and critical sections are involved, breaking into the process with a debugger will likely show at least one thread in a ZwWaitForSingleObject call inside RtlpWaitForCriticalSection.
+
+As the pseudocode shows, there's a bit of bookkeeping in RtlpWaitForCriticalSection, such as incrementing the EntryCount and ContentionCount fields. More important, however, is the issuance of a wait on the LockSemaphore and handling the wait result. The default case passes a null pointer as the third parameter to the ZwWaitForSingleObject call, requesting that the wait never times out. When timeouts are permitted, debug message strings are generated and the wait begins again. Anything other than a successful return from the wait results in an error that halts the process. Finally, when there is a successful return from the ZwWaitForSingleObject call, execution returns from RtlpWaitForCriticalSection and the thread now owns the critical section.
+
+One edge condition that RtlpWaitForCriticalSection must remain cognizant of is when the process is shutting down and the wait is for the loader lock (LdrpLoaderLock) critical section. RtlpWaitForCriticalSection must not allow the thread to block, but must skip the wait and allow the shutdown to continue.
+
+LeaveCriticalSection is not nearly as complicated as EnterCriticalSection. If after decrementing the RecursionCount, the result is not 0 (meaning the thread still owns the critical section), the routine returns with a status of ERROR_SUCCESS. This is why you need to balance Enter calls with the appropriate number of Leave calls. If the count is 0, the OwningThread field is zeroed out and the LockCount decremented. If there are other threads waiting, for example, the LockCount is greater than or equal to 0, RtlpUnWaitCriticalSection is called. This helper routine creates (if it does not already exist) the LockSemaphore and signals it to alert the operating system that the thread has released the critical section. As part of the signaling, one of the waiting threads is taken out of the waiting state and made ready to run.
+
+As a final note, how does the MyCriticalSections program determine the beginning of the critical section chain? If you have access to the correct debug symbols for NTDLL, finding and walking the list is trivial. First, locate the symbol RtlCriticalSectionList, dump its contents (it points to the first RTL_CRITICAL_SECTION_DEBUG structure), and start the walk. Not all systems will have debug symbols, however, and the address for the RtlCriticalSectionList variable changes with each version of Windows. In order to provide a solution that works for all versions, we devised the following heuristic. By observing the steps taken when starting a process, you'll see that critical sections inside of NTDLL are initialized in this order (the names are taken from the debug symbols for NTDLL):
+
+
+Copy
+RtlCriticalSectionLock DeferedCriticalSection (this is the actual spelling!) LoaderLock FastPebLock RtlpCalloutEntryLock PMCritSect UMLogCritSect RtlpProcessHeapsListLock
+Since the loader lock can be found by examining the address at offset 0xA0 in the Process Environment Block (PEB), it becomes relatively simple to locate the beginning of the chain. We read the debug information for the loader lock and then walk the chain backwards two links, which places us at the RtlCriticalSectionLock item, at which point we have the first critical section in the chain. See Figure 4 for an illustration of their method.
+
+Figure 4 Initialization Order
+
+Figure 4** Initialization Order **
+
+Conclusion
+
+Critical sections are used in almost all multithreaded programs. Sooner or later you'll run up against a critical section that deadlocks your code, and you'll be stymied trying to determine how you got into the current state. With a deeper knowledge of how critical sections work, this scenario doesn't have to be as bleak as it first appears. You can examine a supposedly opaque critical section and determine who owns it, along with other useful details. If you're willing to add our library to your linker line, it's trivial to get far more information about your program's critical section usage. By taking advantage of unused fields in the critical section structure, our code can isolate and name just the critical sections your modules use, and tell you their exact state as well.
+
+The enterprising reader can easily extend our code to do even more exotic things. For instance, by intercepting EnterCriticalSection and LeaveCriticalSection in a similar manner to our InitializeCriticalSection hooking, you could store away where the critical section was last successfully acquired and released. Likewise, the CritSect DLL has an easily callable API for enumerating the critical sections in your own code. Using Windows Forms in the .NET Framework, you could create a GUI version of MyCriticalSections with relative ease. The possibilities for extending our code are wide open, and we'd like to see what innovative ideas other people discover and develop.
+
+For related articles see:
+Global Flag Reference: Create kernel mode stack trace database
+GFlags Examples: Enlarging the User-Mode Stack Trace Database
+Under the Hood: Reduce EXE and DLL Size with LIBCTINY.LIB
+
+Matt Pietrek is a software architect and writer. He works for Compuware/NuMega Labs as a lead architect for the BoundsChecker and Distributed Analyzer products. He has authored three books on Windows system programming and is a contributing editor for MSDN Magazine. His Web site (http://www.wheaty.net) has a FAQ and info on previous articles and columns.
+
+Russ Osterlundis a software engineer in the BoundsChecker group with Compuware/NuMega Labs. He, his wife, and their cat are new residents of the state of New Hampshire. He can be reached at RussOsterlund@adelphia.net or at his Web site, http://www.smidgeonsoft.com.
