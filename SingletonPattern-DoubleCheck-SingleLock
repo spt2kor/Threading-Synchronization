@@ -1,0 +1,56 @@
+# https://locklessinc.com/articles/singleton_pattern/
+
+
+class singleton
+{
+public:
+	static singleton& instance()
+	{
+		if (!pinstance_)
+		{
+			scoped_lock(mut_);
+			/* Create it if it doesn't exist. */
+			if (!pinstance_)
+			{
+				pinstance_ = new singleton;
+			}
+		}
+		return *pinstance_;
+	}
+	
+	/* Example body function */
+	static int do_something()
+	{
+		return 0;
+	}
+
+private:	
+	static singleton *pinstance_;
+	mutex mut_;
+	
+	/* Cannot explicitly construct or copy singleton */
+	singleton();
+	singleton(const singleton&);
+	singleton& operator=(const singleton&);
+	virtual ~singleton()
+	{
+		delete pinstance_;
+		pinstance_ = 0;
+	}
+};
+
+/* Example usage */
+int global = singleton::instance().do_something();
+
+
+# IMP NOTE - Explore this
+
+Unfortunately, the double-checked locking technique is broken by design. To see this well known fact, 
+we need to move to a lower level. The problem lies with the pinstance_ = new singleton; 
+statement, and due to the fact that new has two tasks to do. The first is to allocate memory, 
+the second is to construct the object. There is no guarantee at which point the assignment to
+pinstance_ will happen. Thus the code may allocate the memory, and let pinstance_ point to it,
+and then finally construct the object after that is done. The problem is that the first check 
+of pinstance_ will then be able to succeed even though the singleton object isn't fully constructed yet.
+
+
